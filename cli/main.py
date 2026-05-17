@@ -26,6 +26,10 @@ from cli.models import AnalystType
 from cli.utils import *
 from cli.announcements import fetch_announcements, display_announcements
 from cli.stats_handler import StatsCallbackHandler
+from tradingagents.dataflows.analysis_persistence import (
+    save_analysis_to_db,
+    send_analysis_email,
+)
 
 console = Console()
 
@@ -1162,9 +1166,29 @@ def run_analysis(checkpoint: bool = False):
         report_path = Path.cwd() / "reports" / f"{ticker}_{timestamp}"
         try:
             save_report_to_disk(final_state, ticker, report_path)
-            console.print(f"[green]✓ {ticker} report saved to:[/green] {report_path.resolve()}")
+            saved_path = report_path.resolve()
+            console.print(f"[green]✓ {ticker} report saved to:[/green] {saved_path}")
         except Exception as e:
+            saved_path = None
             console.print(f"[red]Error saving report for {ticker}: {e}[/red]")
+
+        # Persist to DB and send email (best-effort, never blocks the flow)
+        try:
+            save_analysis_to_db(
+                ticker, analysis_date, final_state, decision,
+                report_path=str(saved_path) if saved_path else None,
+                config=config,
+            )
+        except Exception as e:
+            console.print(f"[dim]DB save skipped for {ticker}: {e}[/dim]")
+
+        try:
+            send_analysis_email(
+                ticker, analysis_date, decision,
+                report_path=saved_path, final_state=final_state,
+            )
+        except Exception as e:
+            console.print(f"[dim]Email send skipped for {ticker}: {e}[/dim]")
 
         console.print(f"\n[green]✓ {ticker} decision:[/green] [bold]{decision}[/bold]\n")
 

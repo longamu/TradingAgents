@@ -1,12 +1,8 @@
 """Persist analysis results to SQLite and optionally send them via email.
 
-Both features are opt-in. Database storage uses a default path under
-``~/.tradingagents/analysis.db`` and can be disabled by setting the
-env var ``TRADINGAGENTS_DB_PATH`` to an empty string.
-
-Email sending is activated only when the required SMTP environment
-variables (``SMTP_SERVER``, ``SMTP_USERNAME``, ``SMTP_PASSWORD``,
-``MAIL_TO``) are all set.
+Both features are opt-in and configured through the project's ``config``
+dict (``DEFAULT_CONFIG`` in ``default_config.py``), with env-var overrides
+via ``TRADINGAGENTS_*`` variables.
 """
 
 from __future__ import annotations
@@ -24,16 +20,14 @@ logger = logging.getLogger(__name__)
 # ── SQLite persistence ──────────────────────────────────────────────────
 
 
-def _get_db_path() -> Optional[str]:
+def _get_db_path(config: dict) -> Optional[str]:
     """Return the DB path, or None if DB persistence is disabled."""
-    raw = os.environ.get("TRADINGAGENTS_DB_PATH")
-    if raw == "":
-        return None  # explicitly disabled
+    raw = config.get("data_cache_dir")
     if raw:
-        return raw
-    # Default: ~/.tradingagents/analysis.db
-    default = os.path.join(os.path.expanduser("~"), ".tradingagents", "analysis.db")
-    return default
+        base = raw
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".tradingagents")
+    return os.path.join(base, "analysis.db")
 
 
 def _ensure_table(conn: sqlite3.Connection):
@@ -73,10 +67,7 @@ def save_analysis_to_db(
     This is a best-effort helper — failures are logged but not propagated
     so they never interrupt the CLI flow.
     """
-    db_path = _get_db_path()
-    if db_path is None:
-        logger.debug("DB persistence disabled (TRADINGAGENTS_DB_PATH is empty)")
-        return
+    db_path = _get_db_path(config or {})
 
     # Extract nested state
     investment_debate = final_state.get("investment_debate_state") or {}
@@ -128,10 +119,10 @@ def save_analysis_to_db(
 # ── Email sending ───────────────────────────────────────────────────────
 
 
-def _email_enabled() -> bool:
-    """Check whether all required SMTP env vars are present."""
-    required = ["SMTP_SERVER", "SMTP_USERNAME", "SMTP_PASSWORD", "MAIL_TO"]
-    return all(os.environ.get(v) for v in required)
+def _email_enabled(config: dict) -> bool:
+    """Check whether all required SMTP config keys are present."""
+    return bool(config.get("smtp_server") and config.get("smtp_username")
+                and config.get("smtp_password") and config.get("smtp_mail_to"))
 
 
 def send_analysis_email(
@@ -140,26 +131,30 @@ def send_analysis_email(
     decision: str,
     report_path: Optional[Path | str] = None,
     final_state: Optional[dict] = None,
+    config: Optional[dict] = None,
 ) -> None:
     """Send analysis results via SMTP.
 
-    Requires env vars: ``SMTP_SERVER``, ``SMTP_PORT`` (default 587),
-    ``SMTP_USERNAME``, ``SMTP_PASSWORD``, ``MAIL_TO`` (recipient address).
-    ``MAIL_CC`` (comma-separated) is optional.
+    Reads SMTP settings from the ``config`` dict (keys ``smtp_server``,
+    ``smtp_port``, ``smtp_username``, ``smtp_password``, ``smtp_mail_to``,
+    ``smtp_mail_cc``), which are populated from ``DEFAULT_CONFIG`` and
+    overridable via ``TRADINGAGENTS_SMTP_*`` env vars.
 
     This is best-effort — failures are logged but not propagated.
     """
-    if not _email_enabled():
-        logger.debug("Email sending disabled — set SMTP_SERVER, SMTP_USERNAME, "
-                      "SMTP_PASSWORD, and MAIL_TO to enable")
+    cfg = config or {}
+    if not _email_enabled(cfg):
+        logger.debug("Email sending disabled — set smtp_server, smtp_username, "
+                      "smtp_password, and smtp_mail_to in config (or their "
+                      "TRADINGAGENTS_SMTP_* env vars) to enable")
         return
 
-    smtp_server = os.environ["SMTP_SERVER"]
-    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-    smtp_user = os.environ["SMTP_USERNAME"]
-    smtp_pass = os.environ["SMTP_PASSWORD"]
-    mail_to = os.environ["MAIL_TO"]
-    mail_cc = os.environ.get("MAIL_CC", "")
+    smtp_server = cfg["smtp_server"]
+    smtp_port = int(cfg.get("smtp_port", 587))
+    smtp_user = cfg["smtp_username"]
+    smtp_pass = cfg["smtp_password"]
+    mail_to = cfg["smtp_mail_to"]
+    mail_cc = cfg.get("smtp_mail_cc") or ""
 
     subject = f"[TradingAgents] Analysis Report: {ticker} — {decision}"
 

@@ -17,6 +17,14 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_MAX_RISK_ROUNDS":      "max_risk_discuss_rounds",
     "TRADINGAGENTS_CHECKPOINT_ENABLED":   "checkpoint_enabled",
     "TRADINGAGENTS_BENCHMARK_TICKER":     "benchmark_ticker",
+    # Email overrides use the same TRADINGAGENTS_ prefix so a single .env
+    # file can drive the entire config surface.
+    "TRADINGAGENTS_SMTP_SERVER":          "smtp_server",
+    "TRADINGAGENTS_SMTP_PORT":            "smtp_port",
+    "TRADINGAGENTS_SMTP_USERNAME":        "smtp_username",
+    "TRADINGAGENTS_SMTP_PASSWORD":        "smtp_password",
+    "TRADINGAGENTS_SMTP_MAIL_TO":         "smtp_mail_to",
+    "TRADINGAGENTS_SMTP_MAIL_CC":         "smtp_mail_cc",
 }
 
 
@@ -118,4 +126,13 @@ DEFAULT_CONFIG = _apply_env_overrides({
         ".AX":  "^AXJO",    # Australia (ASX 200)
         "":     "SPY",      # default for US-listed tickers (no suffix)
     },
+    # SMTP email configuration. When smtp_server and smtp_username are both
+    # set, analysis results are emailed to smtp_mail_to after each run.
+    # All fields can be overridden via TRADINGAGENTS_SMTP_* env vars.
+    "smtp_server": None,       # e.g. smtp.gmail.com
+    "smtp_port": 587,
+    "smtp_username": None,     # SMTP login / sender address
+    "smtp_password": None,     # App password or SMTP password
+    "smtp_mail_to": None,      # Recipient email address
+    "smtp_mail_cc": None,      # Optional comma-separated CC recipients
 })

@@ -1186,6 +1186,7 @@ def run_analysis(checkpoint: bool = False):
             send_analysis_email(
                 ticker, analysis_date, decision,
                 report_path=saved_path, final_state=final_state,
+                config=config,
             )
         except Exception as e:
             console.print(f"[dim]Email send skipped for {ticker}: {e}[/dim]")

@@ -29,6 +29,8 @@ from cli.stats_handler import StatsCallbackHandler
 from tradingagents.dataflows.analysis_persistence import (
     save_analysis_to_db,
     send_analysis_email,
+    retry_failed_emails,
+    count_failed_emails,
 )
 
 console = Console()
@@ -1182,14 +1184,15 @@ def run_analysis(checkpoint: bool = False):
         except Exception as e:
             console.print(f"[dim]DB save skipped for {ticker}: {e}[/dim]")
 
-        try:
-            send_analysis_email(
-                ticker, analysis_date, decision,
-                report_path=saved_path, final_state=final_state,
-                config=config,
+        if not send_analysis_email(
+            ticker, analysis_date, decision,
+            report_path=saved_path, final_state=final_state,
+            config=config,
+        ):
+            failed_count = count_failed_emails(config)
+            console.print(
+                f"[dim]Email queued for retry ({failed_count} pending)[/dim]"
             )
-        except Exception as e:
-            console.print(f"[dim]Email send skipped for {ticker}: {e}[/dim]")
 
         console.print(f"\n[green]✓ {ticker} decision:[/green] [bold]{decision}[/bold]\n")
 
@@ -1225,6 +1228,30 @@ def analyze(
         n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
         console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
     run_analysis(checkpoint=checkpoint)
+
+
+@app.command()
+def retry_emails():
+    """Retry previously failed email deliveries."""
+    config = DEFAULT_CONFIG.copy()
+
+    pending = count_failed_emails(config)
+    if pending == 0:
+        console.print("[green]No failed emails to retry.[/green]")
+        return
+
+    console.print(f"[cyan]Retrying {pending} failed email(s)...[/cyan]")
+    succeeded, failed = retry_failed_emails(config)
+
+    if succeeded:
+        console.print(f"[green]✓ {succeeded} email(s) sent successfully.[/green]")
+    if failed:
+        remaining = count_failed_emails(config)
+        console.print(
+            f"[yellow]{failed} still failed ({remaining} remaining).[/yellow]\n"
+            "Will retry automatically with exponential backoff "
+            "(5min → 15min → 45min)."
+        )
 
 
 if __name__ == "__main__":

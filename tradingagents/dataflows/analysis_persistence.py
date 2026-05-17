@@ -7,6 +7,7 @@ via ``TRADINGAGENTS_*`` variables.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import smtplib
@@ -21,17 +22,23 @@ logger = logging.getLogger(__name__)
 # ── SQLite persistence ──────────────────────────────────────────────────
 
 
-def _get_db_path(config: dict) -> Optional[str]:
-    """Return the DB path, or None if DB persistence is disabled."""
-    raw = config.get("data_cache_dir")
-    if raw:
-        base = raw
-    else:
-        base = os.path.join(os.path.expanduser("~"), ".tradingagents")
+def _get_db_path(config: dict) -> str:
+    """Return the DB path under the cache directory."""
+    base = config.get("data_cache_dir") or os.path.join(
+        os.path.expanduser("~"), ".tradingagents"
+    )
     return os.path.join(base, "analysis.db")
 
 
-def _ensure_table(conn: sqlite3.Connection):
+def _get_conn(config: dict) -> sqlite3.Connection:
+    path = _get_db_path(config)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def _ensure_tables(conn: sqlite3.Connection):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS analysis_results (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +59,27 @@ def _ensure_table(conn: sqlite3.Connection):
             created_at      TEXT    DEFAULT (datetime('now','localtime'))
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS failed_emails (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker          TEXT    NOT NULL,
+            analysis_date   TEXT    NOT NULL,
+            decision        TEXT,
+            report_body     TEXT,
+            report_path     TEXT,
+            smtp_server     TEXT,
+            smtp_port       INTEGER DEFAULT 587,
+            smtp_user       TEXT,
+            mail_to         TEXT,
+            mail_cc         TEXT,
+            retry_count     INTEGER DEFAULT 0,
+            max_retries     INTEGER DEFAULT 3,
+            last_error      TEXT,
+            next_retry_at   TEXT,
+            created_at      TEXT    DEFAULT (datetime('now','localtime')),
+            updated_at      TEXT    DEFAULT (datetime('now','localtime'))
+        )
+    """)
     conn.commit()
 
 
@@ -68,16 +96,18 @@ def save_analysis_to_db(
     This is a best-effort helper — failures are logged but not propagated
     so they never interrupt the CLI flow.
     """
-    db_path = _get_db_path(config or {})
+    cfg = config or {}
+    try:
+        conn = _get_conn(cfg)
+        _ensure_tables(conn)
+    except Exception:
+        logger.exception("Failed to open DB for %s", ticker)
+        return
 
-    # Extract nested state
     investment_debate = final_state.get("investment_debate_state") or {}
     risk_debate = final_state.get("risk_debate_state") or {}
 
     try:
-        conn = sqlite3.connect(db_path)
-        _ensure_table(conn)
-
         import json
 
         conn.execute(
@@ -93,8 +123,8 @@ def save_analysis_to_db(
                 ticker,
                 analysis_date,
                 decision,
-                (config or {}).get("llm_provider"),
-                (config or {}).get("output_language"),
+                cfg.get("llm_provider"),
+                cfg.get("output_language"),
                 final_state.get("market_report"),
                 final_state.get("sentiment_report"),
                 final_state.get("news_report"),
@@ -107,7 +137,7 @@ def save_analysis_to_db(
             ),
         )
         conn.commit()
-        logger.info("Saved analysis for %s on %s to %s", ticker, analysis_date, db_path)
+        logger.info("Saved analysis for %s on %s to %s", ticker, analysis_date, _get_db_path(cfg))
     except Exception:
         logger.exception("Failed to save analysis for %s to DB", ticker)
     finally:
@@ -121,12 +151,8 @@ def save_analysis_to_db(
 
 
 def _extract_smtp_domain(server: str) -> str:
-    """Extract the registrable domain from an SMTP server hostname.
-
-    ``smtp.qq.com`` → ``qq.com``, ``smtp.gmail.com`` → ``gmail.com``
-    """
+    """Extract the registrable domain from an SMTP server hostname."""
     parts = server.split(".")
-    # Take at most the last two components for the Clash rule
     return ".".join(parts[-2:]) if len(parts) >= 2 else server
 
 
@@ -134,37 +160,24 @@ def _send_smtp(
     server: str, port: int, user: str, password: str,
     msg: EmailMessage, recipients: list[str],
     ticker: str, mail_to: str,
-) -> None:
+) -> tuple[bool, str]:
     """Send *msg* via SMTP, trying SSL first then STARTTLS.
 
-    Port 465 is strongly associated with SMTP-over-SSL; the other common
-    ports (587, 25) expect plain SMTP upgraded via STARTTLS.  Rather than
-    rely on the user picking the *right* port, we try both strategies:
-      1. SMTP_SSL (port 465 or explicit)
-      2. SMTP + STARTTLS (ports 587/25)
+    Returns ``(True, "")`` on success or ``(False, error_message)`` on failure.
     """
-    last_exc: Exception | None = None
+    last_error = ""
 
-    # Detect Clash TUN fake IP (198.18.0.0/15 range) which means a local
-    # proxy is intercepting all traffic and likely blocking SMTP.
-    try:
-        resolved = socket.gethostbyname(server)
-        is_clash_fake = resolved.startswith("198.18.")
-    except Exception:
-        resolved = server
-        is_clash_fake = False
-
-    # Strategy 1 — SMTP_SSL (required for port 465)
+    # Strategy 1 — SMTP_SSL
     try:
         with smtplib.SMTP_SSL(server, port, timeout=30) as s:
             s.login(user, password)
             s.send_message(msg)
         logger.info("Analysis email for %s sent to %s (SSL)", ticker, mail_to)
-        return
+        return True, ""
     except Exception as exc:
-        last_exc = exc
+        last_error = f"SSL({type(exc).__name__}: {exc})"
 
-    # Strategy 2 — SMTP + STARTTLS (standard for ports 587, 25)
+    # Strategy 2 — SMTP + STARTTLS
     try:
         with smtplib.SMTP(server, port, timeout=30) as s:
             s.ehlo()
@@ -174,27 +187,56 @@ def _send_smtp(
             s.login(user, password)
             s.send_message(msg)
         logger.info("Analysis email for %s sent to %s (STARTTLS)", ticker, mail_to)
-        return
+        return True, ""
     except Exception as exc:
-        last_exc = exc
+        last_error += f"; STARTTLS({type(exc).__name__}: {exc})"
 
-    if is_clash_fake:
-        msg_text = (
-            f"{server} resolves to fake IP {resolved} (198.18.x.x) — "
-            "Clash/V2Ray/TUN proxy is blocking the SMTP connection.\n"
-            f"  Fix: add this rule to your Clash config:\n"
-            f"    - DOMAIN-SUFFIX,{_extract_smtp_domain(server)},DIRECT\n"
-            f"  Or: temporarily disable the proxy / TUN mode."
-        )
-        logger.error("%s\nUnderlying error: %s", msg_text, last_exc)
-        raise RuntimeError(msg_text) from last_exc
-    else:
-        msg_text = (
-            f"Failed to send email via {server}:{port} — "
-            "tried SSL and STARTTLS. Error: %s" % last_exc
-        )
-        logger.error(msg_text)
-        raise last_exc from last_exc  # type: ignore[misc]
+    # Detect Clash TUN fake IP for a helpful hint
+    try:
+        resolved = socket.gethostbyname(server)
+        if resolved.startswith("198.18."):
+            return False, (
+                f"{server} resolves to fake IP {resolved} (198.18.x.x) — "
+                "Clash/V2Ray/TUN proxy is blocking SMTP.\n"
+                f"  Fix: add to Clash rules: DOMAIN-SUFFIX,{_extract_smtp_domain(server)},DIRECT"
+            )
+    except Exception:
+        pass
+
+    return False, (
+        f"Tried SSL and STARTTLS on {server}:{port}, both failed. "
+        f"Errors: {last_error}"
+    )
+
+
+def _save_failed_email(
+    conn: sqlite3.Connection,
+    ticker: str, analysis_date: str, decision: str,
+    report_body: str, report_path: Optional[str],
+    smtp_server: str, smtp_port: int, smtp_user: str,
+    mail_to: str, mail_cc: str, error: str,
+):
+    """Insert a failed email record for later retry."""
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # First retry in 5 minutes
+    next_retry = (
+        datetime.datetime.now() + datetime.timedelta(minutes=5)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        """
+        INSERT INTO failed_emails
+            (ticker, analysis_date, decision, report_body, report_path,
+             smtp_server, smtp_port, smtp_user, mail_to, mail_cc,
+             last_error, next_retry_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ticker, analysis_date, decision, report_body, report_path,
+            smtp_server, smtp_port, smtp_user, mail_to, mail_cc,
+            error, next_retry, now, now,
+        ),
+    )
+    conn.commit()
 
 
 def send_analysis_email(
@@ -204,19 +246,16 @@ def send_analysis_email(
     report_path: Optional[Path | str] = None,
     final_state: Optional[dict] = None,
     config: Optional[dict] = None,
-) -> None:
+) -> bool:
     """Send analysis results via SMTP.
 
-    Reads SMTP settings from the ``config`` dict (keys ``smtp_server``,
-    ``smtp_port``, ``smtp_username``, ``smtp_password``, ``smtp_mail_to``,
-    ``smtp_mail_cc``), which are populated from ``DEFAULT_CONFIG`` and
-    overridable via ``TRADINGAGENTS_SMTP_*`` env vars.
-
-    This is best-effort — failures are logged but not propagated.
+    Returns ``True`` if sent successfully, ``False`` if skipped or failed.
+    On failure, the failed email is queued into the local SQLite database
+    for later retry via :func:`retry_failed_emails`.
     """
     cfg = config or {}
 
-    # Build email body (independent of config source)
+    # Build email body
     subject = f"[TradingAgents] Analysis Report: {ticker} — {decision}"
     body_parts = [
         f"Ticker: {ticker}",
@@ -225,14 +264,15 @@ def send_analysis_email(
         "",
     ]
     if final_state:
-        if final_state.get("market_report"):
-            body_parts.append(f"Market Report:\n{final_state['market_report'][:2000]}\n")
-        if final_state.get("sentiment_report"):
-            body_parts.append(f"Sentiment Report:\n{final_state['sentiment_report'][:2000]}\n")
-        if final_state.get("news_report"):
-            body_parts.append(f"News Report:\n{final_state['news_report'][:2000]}\n")
-        if final_state.get("fundamentals_report"):
-            body_parts.append(f"Fundamentals Report:\n{final_state['fundamentals_report'][:2000]}\n")
+        for key, label in [
+            ("market_report", "Market Report"),
+            ("sentiment_report", "Sentiment Report"),
+            ("news_report", "News Report"),
+            ("fundamentals_report", "Fundamentals Report"),
+        ]:
+            text = final_state.get(key)
+            if text:
+                body_parts.append(f"{label}:\n{text[:2000]}\n")
     if report_path:
         body_parts.append(f"Full report: {report_path}")
     body = "\n".join(body_parts)
@@ -241,8 +281,7 @@ def send_analysis_email(
     msg["Subject"] = subject
     msg.set_content(body)
 
-    # Resolve SMTP settings: config dict (TRADINGAGENTS_SMTP_*) first,
-    # then fall back to legacy SMTP_SERVER / SMTP_USERNAME / MAIL_TO env vars.
+    # Resolve SMTP settings
     smtp_server = cfg.get("smtp_server") or os.environ.get("SMTP_SERVER")
     smtp_port = int(cfg.get("smtp_port") or os.environ.get("SMTP_PORT", 587))
     smtp_user = cfg.get("smtp_username") or os.environ.get("SMTP_USERNAME")
@@ -251,16 +290,136 @@ def send_analysis_email(
     mail_cc = cfg.get("smtp_mail_cc") or os.environ.get("MAIL_CC", "")
 
     if not (smtp_server and smtp_user and smtp_pass and mail_to):
-        logger.debug("Email sending disabled — set SMTP_SERVER, SMTP_USERNAME, "
-                      "SMTP_PASSWORD, and MAIL_TO env vars (or their "
-                      "TRADINGAGENTS_SMTP_* equivalents)")
-        return
+        logger.debug("Email disabled — SMTP config incomplete")
+        return False
 
     msg["From"] = smtp_user
     msg["To"] = mail_to
     if mail_cc:
         msg["Cc"] = mail_cc
-
     recipients = [mail_to] + ([c.strip() for c in mail_cc.split(",") if c.strip()] if mail_cc else [])
 
-    _send_smtp(smtp_server, smtp_port, smtp_user, smtp_pass, msg, recipients, ticker, mail_to)
+    # Try to send
+    ok, error = _send_smtp(
+        smtp_server, smtp_port, smtp_user, smtp_pass, msg, recipients, ticker, mail_to
+    )
+    if ok:
+        return True
+
+    # On failure, queue into DB for later retry
+    logger.warning("Email failed for %s, queued for retry: %s", ticker, error)
+    try:
+        conn = _get_conn(cfg)
+        _ensure_tables(conn)
+        _save_failed_email(
+            conn, ticker, analysis_date, decision, body,
+            str(report_path) if report_path else None,
+            smtp_server, smtp_port, smtp_user, mail_to, mail_cc, error,
+        )
+        conn.close()
+    except Exception:
+        logger.exception("Failed to queue failed email for %s", ticker)
+
+    return False
+
+
+# ── Retry failed emails ─────────────────────────────────────────────────
+
+
+def retry_failed_emails(config: Optional[dict] = None) -> tuple[int, int]:
+    """Retry all pending failed emails.
+
+    Returns ``(succeeded, failed)`` counts.
+
+    Each failed email is retried up to ``max_retries`` (default 3) with
+    exponential backoff (5min, 15min, 45min). Successful sends are removed
+    from the queue permanently.
+    """
+    cfg = config or {}
+    try:
+        conn = _get_conn(cfg)
+        _ensure_tables(conn)
+    except Exception:
+        logger.exception("Cannot open DB for email retry")
+        return 0, 0
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    succeeded = 0
+    failed = 0
+
+    rows = conn.execute(
+        "SELECT * FROM failed_emails WHERE retry_count < max_retries "
+        "AND (next_retry_at IS NULL OR next_retry_at <= ?)",
+        (now,),
+    ).fetchall()
+
+    if not rows:
+        conn.close()
+        return 0, 0
+
+    # Resolve current SMTP password from env (not stored in DB)
+    smtp_pass = (
+        (cfg.get("smtp_password") or os.environ.get("SMTP_PASSWORD"))
+    )
+
+    for row in rows:
+        row = dict(row)
+        eid = row["id"]
+        ticker = row["ticker"]
+
+        # Reconstruct email
+        msg = EmailMessage()
+        msg["Subject"] = f"[TradingAgents] Analysis Report: {ticker} — {row['decision']}"
+        msg["From"] = row["smtp_user"]
+        msg["To"] = row["mail_to"]
+        if row.get("mail_cc"):
+            msg["Cc"] = row["mail_cc"]
+        msg.set_content(row["report_body"])
+
+        recipients = [row["mail_to"]] + (
+            [c.strip() for c in row["mail_cc"].split(",") if c.strip()]
+            if row.get("mail_cc") else []
+        )
+
+        ok, error = _send_smtp(
+            row["smtp_server"],
+            row["smtp_port"] or 587,
+            row["smtp_user"],
+            smtp_pass or "",
+            msg, recipients, ticker, row["mail_to"],
+        )
+
+        if ok:
+            conn.execute("DELETE FROM failed_emails WHERE id = ?", (eid,))
+            succeeded += 1
+        else:
+            new_count = (row["retry_count"] or 0) + 1
+            # Exponential backoff: 5min, 15min, 45min
+            backoff_minutes = 5 * (3 ** (new_count - 1))
+            next_retry = (
+                datetime.datetime.now() + datetime.timedelta(minutes=backoff_minutes)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                "UPDATE failed_emails SET retry_count=?, last_error=?, "
+                "next_retry_at=?, updated_at=? WHERE id=?",
+                (new_count, error, next_retry, now, eid),
+            )
+            failed += 1
+
+    conn.commit()
+    conn.close()
+    return succeeded, failed
+
+
+def count_failed_emails(config: Optional[dict] = None) -> int:
+    """Return the number of emails awaiting retry."""
+    try:
+        conn = _get_conn(config or {})
+        _ensure_tables(conn)
+        row = conn.execute(
+            "SELECT COUNT(*) FROM failed_emails WHERE retry_count < max_retries"
+        ).fetchone()
+        conn.close()
+        return row[0] if row else 0
+    except Exception:
+        return 0

@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import smtplib
+import socket
 import sqlite3
 from email.message import EmailMessage
 from pathlib import Path
@@ -119,6 +120,16 @@ def save_analysis_to_db(
 # ── Email sending ───────────────────────────────────────────────────────
 
 
+def _extract_smtp_domain(server: str) -> str:
+    """Extract the registrable domain from an SMTP server hostname.
+
+    ``smtp.qq.com`` → ``qq.com``, ``smtp.gmail.com`` → ``gmail.com``
+    """
+    parts = server.split(".")
+    # Take at most the last two components for the Clash rule
+    return ".".join(parts[-2:]) if len(parts) >= 2 else server
+
+
 def _send_smtp(
     server: str, port: int, user: str, password: str,
     msg: EmailMessage, recipients: list[str],
@@ -131,9 +142,17 @@ def _send_smtp(
     rely on the user picking the *right* port, we try both strategies:
       1. SMTP_SSL (port 465 or explicit)
       2. SMTP + STARTTLS (ports 587/25)
-      3. Plain SMTP (last resort for misconfigured servers)
     """
     last_exc: Exception | None = None
+
+    # Detect Clash TUN fake IP (198.18.0.0/15 range) which means a local
+    # proxy is intercepting all traffic and likely blocking SMTP.
+    try:
+        resolved = socket.gethostbyname(server)
+        is_clash_fake = resolved.startswith("198.18.")
+    except Exception:
+        resolved = server
+        is_clash_fake = False
 
     # Strategy 1 — SMTP_SSL (required for port 465)
     try:
@@ -159,14 +178,23 @@ def _send_smtp(
     except Exception as exc:
         last_exc = exc
 
-    logger.error(
-        "Failed to send analysis email for %s — tried SSL and STARTTLS on %s:%d. "
-        "Check that SMTP_PORT (%d) matches your provider's requirement "
-        "(465 for SSL, 587 for STARTTLS). "
-        "Error: %s",
-        ticker, server, port, port, last_exc,
-    )
-    raise last_exc from last_exc  # type: ignore[misc]
+    if is_clash_fake:
+        msg_text = (
+            f"{server} resolves to fake IP {resolved} (198.18.x.x) — "
+            "Clash/V2Ray/TUN proxy is blocking the SMTP connection.\n"
+            f"  Fix: add this rule to your Clash config:\n"
+            f"    - DOMAIN-SUFFIX,{_extract_smtp_domain(server)},DIRECT\n"
+            f"  Or: temporarily disable the proxy / TUN mode."
+        )
+        logger.error("%s\nUnderlying error: %s", msg_text, last_exc)
+        raise RuntimeError(msg_text) from last_exc
+    else:
+        msg_text = (
+            f"Failed to send email via {server}:{port} — "
+            "tried SSL and STARTTLS. Error: %s" % last_exc
+        )
+        logger.error(msg_text)
+        raise last_exc from last_exc  # type: ignore[misc]
 
 
 def send_analysis_email(

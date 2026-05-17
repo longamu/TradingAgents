@@ -495,15 +495,15 @@ def get_user_selections():
             box_content += f"\n[dim]Default: {default}[/dim]"
         return Panel(box_content, border_style="blue", padding=(1, 2))
 
-    # Step 1: Ticker symbol
+    # Step 1: Ticker symbol(s)
     console.print(
         create_question_box(
-            "Step 1: Ticker Symbol",
-            "Enter the exact ticker symbol to analyze, including exchange suffix when needed (examples: SPY, CNC.TO, 7203.T, 0700.HK)",
+            "Step 1: Ticker Symbol(s)",
+            "Enter one or more ticker symbols, comma-separated. Include exchange suffix when needed (examples: SPY, 600519.SS, 000858.SZ, 0700.HK)",
             "SPY",
         )
     )
-    selected_ticker = get_ticker()
+    selected_tickers = get_tickers()
 
     # Step 2: Analysis date
     default_date = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -613,7 +613,7 @@ def get_user_selections():
         anthropic_effort = ask_anthropic_effort()
 
     return {
-        "ticker": selected_ticker,
+        "tickers": selected_tickers,
         "analysis_date": analysis_date,
         "analysts": selected_analysts,
         "research_depth": selected_research_depth,
@@ -628,27 +628,28 @@ def get_user_selections():
     }
 
 
-def get_ticker():
-    """Get ticker symbol from user input, preserving exchange suffixes."""
-    # typer.prompt strips trailing dot-suffixes on some shells (e.g. 000404.SH
-    # collapses to 000404). questionary.text reads the raw line.
-    ticker = questionary.text(
+def get_tickers():
+    """Get one or more ticker symbols from user input, comma-separated."""
+    raw = questionary.text(
         "",
         validate=lambda value: (
             not value.strip()
-            or (
-                all(ch.isalnum() or ch in "._-^" for ch in value.strip())
-                and len(value.strip()) <= 32
+            or all(
+                all(ch.isalnum() or ch in "._-^" for ch in t.strip())
+                and len(t.strip()) <= 32
+                for t in value.split(",")
             )
         )
-        or "Please enter a valid ticker symbol, e.g. AAPL, 000404.SZ, 0700.HK.",
+        or "Please enter valid ticker symbols, e.g. AAPL, 600519.SS, 0700.HK.",
     ).ask()
 
-    if ticker is None:
+    if raw is None:
         console.print("\n[red]No ticker symbol provided. Exiting...[/red]")
         raise typer.Exit(1)
 
-    return (ticker.strip() or "SPY").upper()
+    tickers = [t.strip().upper() for t in raw.split(",") if t.strip()] or ["SPY"]
+    console.print(f"[green]Tickers:[/green] {', '.join(tickers)}")
+    return tickers
 
 
 def get_analysis_date():
@@ -960,135 +961,81 @@ def format_tool_args(args, max_length=80) -> str:
         return result[:max_length - 3] + "..."
     return result
 
-def run_analysis(checkpoint: bool = False):
-    # First get all user selections
-    selections = get_user_selections()
-
-    # Create config with selected research depth
-    config = DEFAULT_CONFIG.copy()
-    config["max_debate_rounds"] = selections["research_depth"]
-    config["max_risk_discuss_rounds"] = selections["research_depth"]
-    config["quick_think_llm"] = selections["shallow_thinker"]
-    config["deep_think_llm"] = selections["deep_thinker"]
-    config["backend_url"] = selections["backend_url"]
-    config["llm_provider"] = selections["llm_provider"].lower()
-    # Provider-specific thinking configuration
-    config["google_thinking_level"] = selections.get("google_thinking_level")
-    config["openai_reasoning_effort"] = selections.get("openai_reasoning_effort")
-    config["anthropic_effort"] = selections.get("anthropic_effort")
-    config["output_language"] = selections.get("output_language", "English")
-    config["checkpoint_enabled"] = checkpoint
-
-    # Create stats callback handler for tracking LLM/tool calls
-    stats_handler = StatsCallbackHandler()
-
-    # Normalize analyst selection to predefined order (selection is a 'set', order is fixed)
-    selected_set = {analyst.value for analyst in selections["analysts"]}
-    selected_analyst_keys = [a for a in ANALYST_ORDER if a in selected_set]
-
-    # Initialize the graph with callbacks bound to LLMs
-    graph = TradingAgentsGraph(
-        selected_analyst_keys,
-        config=config,
-        debug=True,
-        callbacks=[stats_handler],
-    )
-
-    # Initialize message buffer with selected analysts
-    message_buffer.init_for_analysis(selected_analyst_keys)
-
-    # Track start time for elapsed display
-    start_time = time.time()
-
-    # Create result directory
-    results_dir = Path(config["results_dir"]) / selections["ticker"] / selections["analysis_date"]
+def _run_single_ticker(
+    graph, ticker: str, analysis_date: str, selected_analyst_keys: list,
+    stats_handler, config: dict, selections: dict,
+) -> tuple[dict, str]:
+    """Run analysis for a single ticker with live display. Returns (final_state, decision)."""
+    # Per-ticker logging directories
+    results_dir = Path(config["results_dir"]) / ticker / analysis_date
     results_dir.mkdir(parents=True, exist_ok=True)
     report_dir = results_dir / "reports"
     report_dir.mkdir(parents=True, exist_ok=True)
     log_file = results_dir / "message_tool.log"
     log_file.touch(exist_ok=True)
 
-    def save_message_decorator(obj, func_name):
+    message_buffer.init_for_analysis(selected_analyst_keys)
+
+    def _make_save_wrapper(obj, func_name):
         func = getattr(obj, func_name)
         @wraps(func)
         def wrapper(*args, **kwargs):
             func(*args, **kwargs)
-            timestamp, message_type, content = obj.messages[-1]
-            content = content.replace("\n", " ")  # Replace newlines with spaces
+            timestamp, mtype, content = obj.messages[-1]
             with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"{timestamp} [{message_type}] {content}\n")
-        return wrapper
-    
-    def save_tool_call_decorator(obj, func_name):
-        func = getattr(obj, func_name)
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            func(*args, **kwargs)
-            timestamp, tool_name, args = obj.tool_calls[-1]
-            args_str = ", ".join(f"{k}={v}" for k, v in args.items())
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"{timestamp} [Tool Call] {tool_name}({args_str})\n")
+                f.write(f"{timestamp} [{mtype}] {content.replace(chr(10), ' ')}\n")
         return wrapper
 
-    def save_report_section_decorator(obj, func_name):
+    def _make_tool_wrapper(obj, func_name):
+        func = getattr(obj, func_name)
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            func(*args, **kwargs)
+            timestamp, tname, targs = obj.tool_calls[-1]
+            args_str = ", ".join(f"{k}={v}" for k, v in targs.items())
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(f"{timestamp} [Tool Call] {tname}({args_str})\n")
+        return wrapper
+
+    def _make_report_wrapper(obj, func_name):
         func = getattr(obj, func_name)
         @wraps(func)
         def wrapper(section_name, content):
             func(section_name, content)
             if section_name in obj.report_sections and obj.report_sections[section_name] is not None:
-                content = obj.report_sections[section_name]
-                if content:
-                    file_name = f"{section_name}.md"
-                    text = "\n".join(str(item) for item in content) if isinstance(content, list) else content
-                    with open(report_dir / file_name, "w", encoding="utf-8") as f:
-                        f.write(text)
+                body = obj.report_sections[section_name]
+                if body:
+                    text = "\n".join(str(item) for item in body) if isinstance(body, list) else body
+                    (report_dir / f"{section_name}.md").write_text(text, encoding="utf-8")
         return wrapper
 
-    message_buffer.add_message = save_message_decorator(message_buffer, "add_message")
-    message_buffer.add_tool_call = save_tool_call_decorator(message_buffer, "add_tool_call")
-    message_buffer.update_report_section = save_report_section_decorator(message_buffer, "update_report_section")
+    message_buffer.add_message = _make_save_wrapper(message_buffer, "add_message")
+    message_buffer.add_tool_call = _make_tool_wrapper(message_buffer, "add_tool_call")
+    message_buffer.update_report_section = _make_report_wrapper(message_buffer, "update_report_section")
 
-    # Now start the display layout
     layout = create_layout()
 
     with Live(layout, refresh_per_second=4) as live:
-        # Initial display
-        update_display(layout, stats_handler=stats_handler, start_time=start_time)
+        update_display(layout, stats_handler=stats_handler, start_time=None)
 
-        # Add initial messages
-        message_buffer.add_message("System", f"Selected ticker: {selections['ticker']}")
-        message_buffer.add_message(
-            "System", f"Analysis date: {selections['analysis_date']}"
-        )
+        message_buffer.add_message("System", f"Selected ticker: {ticker}")
+        message_buffer.add_message("System", f"Analysis date: {analysis_date}")
         message_buffer.add_message(
             "System",
-            f"Selected analysts: {', '.join(analyst.value for analyst in selections['analysts'])}",
+            f"Selected analysts: {', '.join(a.value for a in selections['analysts'])}",
         )
-        update_display(layout, stats_handler=stats_handler, start_time=start_time)
+        update_display(layout, stats_handler=stats_handler, start_time=None)
 
-        # Update agent status to in_progress for the first analyst
         first_analyst = f"{selections['analysts'][0].value.capitalize()} Analyst"
         message_buffer.update_agent_status(first_analyst, "in_progress")
-        update_display(layout, stats_handler=stats_handler, start_time=start_time)
+        update_display(layout, stats_handler=stats_handler, start_time=None)
 
-        # Create spinner text
-        spinner_text = (
-            f"Analyzing {selections['ticker']} on {selections['analysis_date']}..."
-        )
-        update_display(layout, spinner_text, stats_handler=stats_handler, start_time=start_time)
-
-        # Initialize state and get graph args with callbacks
-        init_agent_state = graph.propagator.create_initial_state(
-            selections["ticker"], selections["analysis_date"]
-        )
-        # Pass callbacks to graph config for tool execution tracking
-        # (LLM tracking is handled separately via LLM constructor)
+        init_state = graph.propagator.create_initial_state(ticker, analysis_date)
         args = graph.propagator.get_graph_args(callbacks=[stats_handler])
 
-        # Stream the analysis
+        start_time = time.time()
         trace = []
-        for chunk in graph.graph.stream(init_agent_state, **args):
-            # Process all messages in chunk, deduplicating by message ID
+        for chunk in graph.graph.stream(init_state, **args):
             for message in chunk.get("messages", []):
                 msg_id = getattr(message, "id", None)
                 if msg_id is not None:
@@ -1099,139 +1046,140 @@ def run_analysis(checkpoint: bool = False):
                 msg_type, content = classify_message_type(message)
                 if content and content.strip():
                     message_buffer.add_message(msg_type, content)
-
                 if hasattr(message, "tool_calls") and message.tool_calls:
-                    for tool_call in message.tool_calls:
-                        if isinstance(tool_call, dict):
-                            message_buffer.add_tool_call(tool_call["name"], tool_call["args"])
-                        else:
-                            message_buffer.add_tool_call(tool_call.name, tool_call.args)
+                    for tc in message.tool_calls:
+                        tc_name = tc["name"] if isinstance(tc, dict) else tc.name
+                        tc_args = tc["args"] if isinstance(tc, dict) else tc.args
+                        message_buffer.add_tool_call(tc_name, tc_args)
 
-            # Update analyst statuses based on report state (runs on every chunk)
             update_analyst_statuses(message_buffer, chunk)
 
-            # Research Team - Handle Investment Debate State
             if chunk.get("investment_debate_state"):
-                debate_state = chunk["investment_debate_state"]
-                bull_hist = debate_state.get("bull_history", "").strip()
-                bear_hist = debate_state.get("bear_history", "").strip()
-                judge = debate_state.get("judge_decision", "").strip()
-
-                # Only update status when there's actual content
-                if bull_hist or bear_hist:
+                ds = chunk["investment_debate_state"]
+                bull = ds.get("bull_history", "").strip()
+                bear = ds.get("bear_history", "").strip()
+                judge = ds.get("judge_decision", "").strip()
+                if bull or bear:
                     update_research_team_status("in_progress")
-                if bull_hist:
-                    message_buffer.update_report_section(
-                        "investment_plan", f"### Bull Researcher Analysis\n{bull_hist}"
-                    )
-                if bear_hist:
-                    message_buffer.update_report_section(
-                        "investment_plan", f"### Bear Researcher Analysis\n{bear_hist}"
-                    )
+                if bull:
+                    message_buffer.update_report_section("investment_plan", f"### Bull Researcher Analysis\n{bull}")
+                if bear:
+                    message_buffer.update_report_section("investment_plan", f"### Bear Researcher Analysis\n{bear}")
                 if judge:
-                    message_buffer.update_report_section(
-                        "investment_plan", f"### Research Manager Decision\n{judge}"
-                    )
+                    message_buffer.update_report_section("investment_plan", f"### Research Manager Decision\n{judge}")
                     update_research_team_status("completed")
                     message_buffer.update_agent_status("Trader", "in_progress")
 
-            # Trading Team
             if chunk.get("trader_investment_plan"):
-                message_buffer.update_report_section(
-                    "trader_investment_plan", chunk["trader_investment_plan"]
-                )
+                message_buffer.update_report_section("trader_investment_plan", chunk["trader_investment_plan"])
                 if message_buffer.agent_status.get("Trader") != "completed":
                     message_buffer.update_agent_status("Trader", "completed")
                     message_buffer.update_agent_status("Aggressive Analyst", "in_progress")
 
-            # Risk Management Team - Handle Risk Debate State
             if chunk.get("risk_debate_state"):
-                risk_state = chunk["risk_debate_state"]
-                agg_hist = risk_state.get("aggressive_history", "").strip()
-                con_hist = risk_state.get("conservative_history", "").strip()
-                neu_hist = risk_state.get("neutral_history", "").strip()
-                judge = risk_state.get("judge_decision", "").strip()
-
-                if agg_hist:
+                rs = chunk["risk_debate_state"]
+                agg = rs.get("aggressive_history", "").strip()
+                con = rs.get("conservative_history", "").strip()
+                neu = rs.get("neutral_history", "").strip()
+                judge = rs.get("judge_decision", "").strip()
+                if agg:
+                    message_buffer.update_report_section("final_trade_decision", f"### Aggressive Analyst Analysis\n{agg}")
                     if message_buffer.agent_status.get("Aggressive Analyst") != "completed":
                         message_buffer.update_agent_status("Aggressive Analyst", "in_progress")
-                    message_buffer.update_report_section(
-                        "final_trade_decision", f"### Aggressive Analyst Analysis\n{agg_hist}"
-                    )
-                if con_hist:
+                if con:
+                    message_buffer.update_report_section("final_trade_decision", f"### Conservative Analyst Analysis\n{con}")
                     if message_buffer.agent_status.get("Conservative Analyst") != "completed":
                         message_buffer.update_agent_status("Conservative Analyst", "in_progress")
-                    message_buffer.update_report_section(
-                        "final_trade_decision", f"### Conservative Analyst Analysis\n{con_hist}"
-                    )
-                if neu_hist:
+                if neu:
+                    message_buffer.update_report_section("final_trade_decision", f"### Neutral Analyst Analysis\n{neu}")
                     if message_buffer.agent_status.get("Neutral Analyst") != "completed":
                         message_buffer.update_agent_status("Neutral Analyst", "in_progress")
-                    message_buffer.update_report_section(
-                        "final_trade_decision", f"### Neutral Analyst Analysis\n{neu_hist}"
-                    )
                 if judge:
-                    if message_buffer.agent_status.get("Portfolio Manager") != "completed":
-                        message_buffer.update_agent_status("Portfolio Manager", "in_progress")
-                        message_buffer.update_report_section(
-                            "final_trade_decision", f"### Portfolio Manager Decision\n{judge}"
-                        )
-                        message_buffer.update_agent_status("Aggressive Analyst", "completed")
-                        message_buffer.update_agent_status("Conservative Analyst", "completed")
-                        message_buffer.update_agent_status("Neutral Analyst", "completed")
-                        message_buffer.update_agent_status("Portfolio Manager", "completed")
+                    message_buffer.update_report_section("final_trade_decision", f"### Portfolio Manager Decision\n{judge}")
+                    for a in ("Aggressive Analyst", "Conservative Analyst", "Neutral Analyst", "Portfolio Manager"):
+                        message_buffer.update_agent_status(a, "completed")
 
-            # Update the display
             update_display(layout, stats_handler=stats_handler, start_time=start_time)
-
             trace.append(chunk)
 
-        # Streamed chunks are per-node deltas, not full state. Merge them
-        # so every report field populated across the run is present.
         final_state = {}
         for chunk in trace:
             final_state.update(chunk)
         decision = graph.process_signal(final_state["final_trade_decision"])
 
-        # Update all agent statuses to completed
         for agent in message_buffer.agent_status:
             message_buffer.update_agent_status(agent, "completed")
-
-        message_buffer.add_message(
-            "System", f"Completed analysis for {selections['analysis_date']}"
-        )
-
-        # Update final report sections
-        for section in message_buffer.report_sections.keys():
+        message_buffer.add_message("System", f"Completed analysis for {analysis_date}")
+        for section in message_buffer.report_sections:
             if section in final_state:
                 message_buffer.update_report_section(section, final_state[section])
-
         update_display(layout, stats_handler=stats_handler, start_time=start_time)
 
-    # Post-analysis prompts (outside Live context for clean interaction)
-    console.print("\n[bold cyan]Analysis Complete![/bold cyan]\n")
+    return final_state, decision
 
-    # Prompt to save report
-    save_choice = typer.prompt("Save report?", default="Y").strip().upper()
-    if save_choice in ("Y", "YES", ""):
+
+def run_analysis(checkpoint: bool = False):
+    selections = get_user_selections()
+    tickers = selections["tickers"]
+    analysis_date = selections["analysis_date"]
+
+    # Create config with selected research depth
+    config = DEFAULT_CONFIG.copy()
+    config["max_debate_rounds"] = selections["research_depth"]
+    config["max_risk_discuss_rounds"] = selections["research_depth"]
+    config["quick_think_llm"] = selections["shallow_thinker"]
+    config["deep_think_llm"] = selections["deep_thinker"]
+    config["backend_url"] = selections["backend_url"]
+    config["llm_provider"] = selections["llm_provider"].lower()
+    config["google_thinking_level"] = selections.get("google_thinking_level")
+    config["openai_reasoning_effort"] = selections.get("openai_reasoning_effort")
+    config["anthropic_effort"] = selections.get("anthropic_effort")
+    config["output_language"] = selections.get("output_language", "English")
+    config["checkpoint_enabled"] = checkpoint
+
+    stats_handler = StatsCallbackHandler()
+    selected_set = {analyst.value for analyst in selections["analysts"]}
+    selected_analyst_keys = [a for a in ANALYST_ORDER if a in selected_set]
+
+    graph = TradingAgentsGraph(
+        selected_analyst_keys,
+        config=config,
+        debug=True,
+        callbacks=[stats_handler],
+    )
+
+    all_decisions: dict[str, str] = {}
+
+    for i, ticker in enumerate(tickers, 1):
+        console.print(f"\n[bold cyan]--- [{i}/{len(tickers)}] Analyzing {ticker} ---[/bold cyan]\n")
+        final_state, decision = _run_single_ticker(
+            graph, ticker, analysis_date, selected_analyst_keys,
+            stats_handler, config, selections,
+        )
+        all_decisions[ticker] = decision
+
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_path = Path.cwd() / "reports" / f"{selections['ticker']}_{timestamp}"
-        save_path_str = typer.prompt(
-            "Save path (press Enter for default)",
-            default=str(default_path)
-        ).strip()
-        save_path = Path(save_path_str)
+        report_path = Path.cwd() / "reports" / f"{ticker}_{timestamp}"
         try:
-            report_file = save_report_to_disk(final_state, selections["ticker"], save_path)
-            console.print(f"\n[green]✓ Report saved to:[/green] {save_path.resolve()}")
-            console.print(f"  [dim]Complete report:[/dim] {report_file.name}")
+            save_report_to_disk(final_state, ticker, report_path)
+            console.print(f"[green]✓ {ticker} report saved to:[/green] {report_path.resolve()}")
         except Exception as e:
-            console.print(f"[red]Error saving report: {e}[/red]")
+            console.print(f"[red]Error saving report for {ticker}: {e}[/red]")
 
-    # Prompt to display full report
-    display_choice = typer.prompt("\nDisplay full report on screen?", default="Y").strip().upper()
-    if display_choice in ("Y", "YES", ""):
-        display_complete_report(final_state)
+        console.print(f"\n[green]✓ {ticker} decision:[/green] [bold]{decision}[/bold]\n")
+
+    # Summary table
+    console.print(Rule("[bold green]All Tickers Summary[/bold green]"))
+    summary_table = Table(show_header=True, header_style="bold cyan", box=box.ROUNDED)
+    summary_table.add_column("#", style="dim", width=4)
+    summary_table.add_column("Ticker", style="yellow", width=14)
+    summary_table.add_column("Decision", style="green", width=16)
+    summary_table.add_column("Date", width=12)
+    for idx, (ticker, decision) in enumerate(all_decisions.items(), 1):
+        color = {"Buy": "green", "Overweight": "cyan", "Hold": "yellow",
+                 "Underweight": "orange1", "Sell": "red"}.get(decision, "white")
+        summary_table.add_row(str(idx), ticker, f"[{color}]{decision}[/{color}]", analysis_date)
+    console.print(summary_table)
 
 
 @app.command()

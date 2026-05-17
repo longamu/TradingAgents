@@ -1,5 +1,7 @@
+import threading
 import time
 import logging
+import random
 
 import pandas as pd
 import yfinance as yf
@@ -12,23 +14,50 @@ from .utils import safe_ticker_component
 
 logger = logging.getLogger(__name__)
 
+# Global rate limiter for yfinance calls — limits to ~2 requests per second
+# to stay under Yahoo Finance's soft rate limit.
+_last_yf_call = 0
+_yf_lock = threading.Lock()
 
-def yf_retry(func, max_retries=3, base_delay=2.0):
-    """Execute a yfinance call with exponential backoff on rate limits.
+
+def _yf_throttle():
+    """Ensure at least ``min_interval`` seconds since the last yfinance call."""
+    global _last_yf_call
+    min_interval = 0.5  # 500ms between calls
+    with _yf_lock:
+        now = time.time()
+        elapsed = now - _last_yf_call
+        if elapsed < min_interval:
+            sleep_time = min_interval - elapsed
+            time.sleep(sleep_time)
+        _last_yf_call = time.time()
+
+
+def yf_retry(func, max_retries=5, base_delay=2.0):
+    """Execute a yfinance call with throttling and exponential backoff on rate limits.
 
     yfinance raises YFRateLimitError on HTTP 429 responses but does not
-    retry them internally. This wrapper adds retry logic specifically
-    for rate limits. Other exceptions propagate immediately.
+    retry them internally. This wrapper adds throttling and retry logic
+    specifically for rate limits. Other exceptions propagate immediately.
     """
+    _yf_throttle()
     for attempt in range(max_retries + 1):
         try:
             return func()
         except YFRateLimitError:
             if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                logger.warning(f"Yahoo Finance rate limited, retrying in {delay:.0f}s (attempt {attempt + 1}/{max_retries})")
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(
+                    "Yahoo Finance rate limited, retrying in %.0fs "
+                    "(attempt %d/%d)",
+                    delay, attempt + 1, max_retries,
+                )
                 time.sleep(delay)
             else:
+                logger.error(
+                    "Yahoo Finance rate limit exceeded after %d retries, giving up",
+                    max_retries,
+                )
                 raise
 
 
@@ -81,7 +110,7 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
             multi_level_index=False,
             progress=False,
             auto_adjust=True,
-        ))
+        ), max_retries=5, base_delay=5.0)
         data = data.reset_index()
         data.to_csv(data_file, index=False, encoding="utf-8")
 

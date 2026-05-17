@@ -119,10 +119,54 @@ def save_analysis_to_db(
 # ── Email sending ───────────────────────────────────────────────────────
 
 
-def _email_enabled(config: dict) -> bool:
-    """Check whether all required SMTP config keys are present."""
-    return bool(config.get("smtp_server") and config.get("smtp_username")
-                and config.get("smtp_password") and config.get("smtp_mail_to"))
+def _send_smtp(
+    server: str, port: int, user: str, password: str,
+    msg: EmailMessage, recipients: list[str],
+    ticker: str, mail_to: str,
+) -> None:
+    """Send *msg* via SMTP, trying SSL first then STARTTLS.
+
+    Port 465 is strongly associated with SMTP-over-SSL; the other common
+    ports (587, 25) expect plain SMTP upgraded via STARTTLS.  Rather than
+    rely on the user picking the *right* port, we try both strategies:
+      1. SMTP_SSL (port 465 or explicit)
+      2. SMTP + STARTTLS (ports 587/25)
+      3. Plain SMTP (last resort for misconfigured servers)
+    """
+    last_exc: Exception | None = None
+
+    # Strategy 1 — SMTP_SSL (required for port 465)
+    try:
+        with smtplib.SMTP_SSL(server, port, timeout=30) as s:
+            s.login(user, password)
+            s.send_message(msg)
+        logger.info("Analysis email for %s sent to %s (SSL)", ticker, mail_to)
+        return
+    except Exception as exc:
+        last_exc = exc
+
+    # Strategy 2 — SMTP + STARTTLS (standard for ports 587, 25)
+    try:
+        with smtplib.SMTP(server, port, timeout=30) as s:
+            s.ehlo()
+            if s.has_extn("STARTTLS"):
+                s.starttls()
+                s.ehlo()
+            s.login(user, password)
+            s.send_message(msg)
+        logger.info("Analysis email for %s sent to %s (STARTTLS)", ticker, mail_to)
+        return
+    except Exception as exc:
+        last_exc = exc
+
+    logger.error(
+        "Failed to send analysis email for %s — tried SSL and STARTTLS on %s:%d. "
+        "Check that SMTP_PORT (%d) matches your provider's requirement "
+        "(465 for SSL, 587 for STARTTLS). "
+        "Error: %s",
+        ticker, server, port, port, last_exc,
+    )
+    raise last_exc from last_exc  # type: ignore[misc]
 
 
 def send_analysis_email(
@@ -143,22 +187,9 @@ def send_analysis_email(
     This is best-effort — failures are logged but not propagated.
     """
     cfg = config or {}
-    if not _email_enabled(cfg):
-        logger.debug("Email sending disabled — set smtp_server, smtp_username, "
-                      "smtp_password, and smtp_mail_to in config (or their "
-                      "TRADINGAGENTS_SMTP_* env vars) to enable")
-        return
 
-    smtp_server = cfg["smtp_server"]
-    smtp_port = int(cfg.get("smtp_port", 587))
-    smtp_user = cfg["smtp_username"]
-    smtp_pass = cfg["smtp_password"]
-    mail_to = cfg["smtp_mail_to"]
-    mail_cc = cfg.get("smtp_mail_cc") or ""
-
+    # Build email body (independent of config source)
     subject = f"[TradingAgents] Analysis Report: {ticker} — {decision}"
-
-    # Build email body
     body_parts = [
         f"Ticker: {ticker}",
         f"Analysis Date: {analysis_date}",
@@ -176,23 +207,32 @@ def send_analysis_email(
             body_parts.append(f"Fundamentals Report:\n{final_state['fundamentals_report'][:2000]}\n")
     if report_path:
         body_parts.append(f"Full report: {report_path}")
-
     body = "\n".join(body_parts)
 
     msg = EmailMessage()
     msg["Subject"] = subject
+    msg.set_content(body)
+
+    # Resolve SMTP settings: config dict (TRADINGAGENTS_SMTP_*) first,
+    # then fall back to legacy SMTP_SERVER / SMTP_USERNAME / MAIL_TO env vars.
+    smtp_server = cfg.get("smtp_server") or os.environ.get("SMTP_SERVER")
+    smtp_port = int(cfg.get("smtp_port") or os.environ.get("SMTP_PORT", 587))
+    smtp_user = cfg.get("smtp_username") or os.environ.get("SMTP_USERNAME")
+    smtp_pass = cfg.get("smtp_password") or os.environ.get("SMTP_PASSWORD")
+    mail_to = cfg.get("smtp_mail_to") or os.environ.get("MAIL_TO")
+    mail_cc = cfg.get("smtp_mail_cc") or os.environ.get("MAIL_CC", "")
+
+    if not (smtp_server and smtp_user and smtp_pass and mail_to):
+        logger.debug("Email sending disabled — set SMTP_SERVER, SMTP_USERNAME, "
+                      "SMTP_PASSWORD, and MAIL_TO env vars (or their "
+                      "TRADINGAGENTS_SMTP_* equivalents)")
+        return
+
     msg["From"] = smtp_user
     msg["To"] = mail_to
     if mail_cc:
         msg["Cc"] = mail_cc
-    msg.set_content(body)
 
-    try:
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_pass)
-            recipients = [mail_to] + ([c.strip() for c in mail_cc.split(",") if c.strip()] if mail_cc else [])
-            server.send_message(msg)
-        logger.info("Analysis email for %s sent to %s", ticker, mail_to)
-    except Exception:
-        logger.exception("Failed to send analysis email for %s", ticker)
+    recipients = [mail_to] + ([c.strip() for c in mail_cc.split(",") if c.strip()] if mail_cc else [])
+
+    _send_smtp(smtp_server, smtp_port, smtp_user, smtp_pass, msg, recipients, ticker, mail_to)
